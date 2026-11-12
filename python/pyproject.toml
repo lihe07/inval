@@ -3,7 +3,7 @@ name = "inval"
 version = "0.1.0"
 description = "Cache a function's result in memory and Redis, invalidated in every process on change."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }
 dependencies = ["redis>=5"]
 
