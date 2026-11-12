@@ -1,0 +1,24 @@
+[project]
+name = "inval"
+version = "0.1.0"
+description = "Cache a function's result in memory and Redis, invalidated everywhere on change."
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+dependencies = ["redis>=5"]
+
+[project.urls]
+Repository = "https://github.com/lihe07/inval"
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["inval"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
