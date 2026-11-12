@@ -8,6 +8,7 @@ repository = "https://github.com/lihe07/inval"
 readme = "README.md"
 keywords = ["cache", "redis", "invalidation", "pubsub"]
 categories = ["caching", "asynchronous"]
+exclude = ["python/"]
 
 [workspace]
 members = ["macros"]
