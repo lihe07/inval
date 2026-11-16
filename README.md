@@ -95,17 +95,17 @@ namespace.
 
 ## How it behaves
 
-`query(key, loader)` checks memory, then Redis, then calls `loader`. If two
-requests miss at the same moment, both run the loader. That keeps the code
-simple, and for settings it costs a few duplicate queries right after a
-change.
+`query(key, loader)` checks memory, then Redis, then calls `loader`. Requests
+that miss the same key at the same moment share one load.
 
 `mutation(key, fn)` runs `fn`. If it succeeds, the key is deleted from Redis
 and a broadcast tells every process in the namespace to drop it from memory.
 `invalidate(key)` does the same without running anything.
 
-The process that made the change reads the new value right away. Other
-processes catch up when the broadcast arrives.
+The process that made the change reads the new value right away. In every
+other process, the first request after the broadcast loads the new value, and
+requests that arrive while it does are served the old one. Nobody waits on a
+change they didn't make.
 
 A slow read can't bring an old value back. Each key has a version in Redis
 that every mutation bumps, and a loaded value is only stored if the version
@@ -119,8 +119,8 @@ key per process, not one per request.
 
 Redis pub/sub loses messages while a connection is down, so a disconnected
 process can serve a value another process has changed. That lasts as long as
-the outage: on resubscribing, a process empties its memory and reads
-everything again.
+the outage: on resubscribing, a process treats everything it holds as
+changed and reads it again.
 
 An invalidation that can't reach Redis is kept and sent once Redis is back.
 Until then only the process that made the change sees it.

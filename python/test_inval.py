@@ -128,6 +128,36 @@ async def test_survives_a_lost_subscription(connect, db):
     await eventually(a, db, 8)
 
 
+async def test_concurrent_misses_load_once(connect, db):
+    cache = await connect()
+
+    async def slow_load():
+        await asyncio.sleep(0.05)
+        return db.load()
+
+    assert await asyncio.gather(*(cache.query("k", slow_load) for _ in range(20))) == [0] * 20
+    assert db.reads == 1
+
+
+async def test_others_are_served_the_old_value_during_a_reload(connect, db):
+    a, b = await connect(), await connect()
+    assert await a.query("k", db.load) == 0
+    await b.mutation("k", lambda: db.store(7))
+    await asyncio.sleep(0.1)
+
+    async def slow_load():
+        await asyncio.sleep(0.1)
+        return db.load()
+
+    async def meanwhile():
+        await asyncio.sleep(0.05)
+        return await a.query("k", db.load)
+
+    assert await asyncio.gather(a.query("k", slow_load), meanwhile()) == [7, 0]
+    assert await a.query("k", db.load) == 7
+    assert db.reads == 2
+
+
 async def test_works_without_redis(db):
     cache = await Cache.connect("redis://127.0.0.1:1", "none")
     for _ in range(10):

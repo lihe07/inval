@@ -166,3 +166,43 @@ async fn max_entries_limits_memory() {
         "{from_memory} keys were in memory"
     );
 }
+
+/// Readers that miss together share one load.
+#[tokio::test]
+async fn concurrent_misses_load_once() {
+    let (cache, db) = (connect(&namespace()).await, Db::default());
+    let slow_load = || async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        db.load().await
+    };
+    let reads = (0..20).map(|_| cache.query("k", slow_load));
+    for value in futures_util::future::join_all(reads).await {
+        assert_eq!(*value.unwrap(), 0);
+    }
+    assert_eq!(db.reads.load(SeqCst), 1);
+}
+
+/// After another process's change, one reader loads the new value and the
+/// rest are served the old one meanwhile.
+#[tokio::test]
+async fn others_are_served_the_old_value_during_a_reload() {
+    let (ns, db) = (namespace(), Db::default());
+    let (a, b) = (connect(&ns).await, connect(&ns).await);
+    assert_eq!(read(&a, &db).await, 0);
+
+    b.mutation("k", || db.store(7)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let reload = a.query("k", || async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        db.load().await
+    });
+    let meanwhile = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        read(&a, &db).await
+    };
+    let (reloaded, meanwhile) = tokio::join!(reload, meanwhile);
+    assert_eq!((*reloaded.unwrap(), meanwhile), (7, 0));
+    assert_eq!(read(&a, &db).await, 7);
+    assert_eq!(db.reads.load(SeqCst), 2);
+}
