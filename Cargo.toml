@@ -14,15 +14,15 @@ exclude = ["python/"]
 members = ["macros"]
 
 [dependencies]
-futures-util = { version = "0.3.34", default-features = false }
+futures-util = { version = "0.3", default-features = false }
 inval-macros = { path = "macros", version = "0.2.0" }
-papaya = "0.2.5"
-redis = { version = "1.8.1", features = ["tokio-comp", "connection-manager", "script"] }
-serde = "1.0.229"
-serde_json = "1.0.154"
-thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt", "sync", "time"] }
+papaya = "0.2"
+redis = { version = "1.7", features = ["tokio-comp", "connection-manager", "script"] }
+serde = "1"
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 
 [dev-dependencies]
-futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
-tokio = { version = "1.54.1", features = ["full"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+tokio = { version = "1", features = ["full"] }
