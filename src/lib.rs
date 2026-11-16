@@ -42,8 +42,9 @@
 //! what it holds, loads the rest itself, and catches up when Redis returns.
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -76,66 +77,137 @@ struct Inner {
     namespace: String,
     redis: ConnectionManager,
     set_if_version: redis::Script,
-    values: papaya::HashMap<String, Value>,
+    values: papaya::HashMap<String, Arc<Held>>,
     max_entries: usize,
     state: Mutex<State>,
     listener: OnceLock<tokio::task::JoinHandle<Option<()>>>,
 }
 
-/// One lock, so checking the epoch and inserting can't interleave with an
-/// invalidation.
+/// A value in memory. Once another process changed it, it is stale: still
+/// served, while one reader loads the new one.
+struct Held {
+    value: Value,
+    is_stale: AtomicBool,
+}
+
+/// A key being loaded. Readers take turns, so one load runs at a time.
+#[derive(Default)]
+struct Load {
+    turn: Arc<tokio::sync::Mutex<()>>,
+    /// Set by an invalidation: what this load read may be old, so it is not
+    /// kept.
+    is_outdated: AtomicBool,
+}
+
+/// One lock, so keeping a loaded value can't interleave with an invalidation.
 #[derive(Default)]
 struct State {
     /// Whether invalidations are arriving. Redis is only used while they are.
     listening: bool,
-    /// Bumped on every invalidation; a load is only kept if it didn't change.
-    epoch: u64,
     /// Invalidations Redis has not been told about yet.
     unsent: HashSet<String>,
+    loads: HashMap<String, Arc<Load>>,
+}
+
+/// A reader's place in a key's [`Load`], given up when dropped.
+struct Loading<'a> {
+    cache: &'a Inner,
+    key: &'a str,
+    load: Arc<Load>,
+    turn: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for Loading<'_> {
+    fn drop(&mut self) {
+        self.turn.take();
+        let mut state = self.cache.state.lock().unwrap();
+        // Only the map and this reader still hold it.
+        if Arc::strong_count(&self.load) == 2 {
+            state.loads.remove(self.key);
+        }
+    }
 }
 
 impl Inner {
-    fn get<T: Send + Sync + 'static>(&self, key: &str) -> Option<Arc<T>> {
-        let value = self.values.pin().get(key).cloned()?;
-        Some(
-            value
-                .downcast()
-                .unwrap_or_else(|_| panic!("cache key {key:?} read as two different types")),
-        )
+    /// The value and whether it is stale.
+    fn get<T: Send + Sync + 'static>(&self, key: &str) -> Option<(Arc<T>, bool)> {
+        let held = self.values.pin().get(key).cloned()?;
+        let value = held
+            .value
+            .clone()
+            .downcast()
+            .unwrap_or_else(|_| panic!("cache key {key:?} read as two different types"));
+        Some((value, held.is_stale.load(Relaxed)))
     }
 
-    fn listening_and_epoch(&self) -> (bool, u64) {
-        let state = self.state.lock().unwrap();
-        (state.listening, state.epoch)
-    }
-
-    fn insert(&self, key: &str, value: Value, epoch: u64) {
-        let state = self.state.lock().unwrap();
-        if state.epoch == epoch {
-            let values = self.values.pin();
-            // Hash order makes this a random eviction.
-            if values.len() >= self.max_entries
-                && let Some(evict) = values.keys().find(|k| *k != key)
-            {
-                values.remove(evict);
-            }
-            values.insert(key.to_owned(), value);
+    fn loading<'a>(&'a self, key: &'a str) -> Loading<'a> {
+        let mut state = self.state.lock().unwrap();
+        let load = state.loads.entry(key.to_owned()).or_default().clone();
+        Loading {
+            cache: self,
+            key,
+            load,
+            turn: None,
         }
     }
 
+    /// Called when a load's turn comes. Returns whether Redis can be asked.
+    fn start(&self, load: &Load) -> bool {
+        let state = self.state.lock().unwrap();
+        load.is_outdated.store(false, Relaxed);
+        state.listening
+    }
+
+    fn insert(&self, key: &str, value: Value, load: &Load) {
+        let _state = self.state.lock().unwrap();
+        if load.is_outdated.load(Relaxed) {
+            return;
+        }
+        let values = self.values.pin();
+        // Hash order makes this a random eviction.
+        if values.len() >= self.max_entries
+            && let Some(evict) = values.keys().find(|k| *k != key)
+        {
+            values.remove(evict);
+        }
+        let held = Held {
+            value,
+            is_stale: AtomicBool::new(false),
+        };
+        values.insert(key.to_owned(), Arc::new(held));
+    }
+
+    /// This process changed `key`: its next read must load.
     fn remove(&self, key: &str) {
-        let mut state = self.state.lock().unwrap();
-        state.epoch += 1;
+        let state = self.state.lock().unwrap();
+        if let Some(load) = state.loads.get(key) {
+            load.is_outdated.store(true, Relaxed);
+        }
         self.values.pin().remove(key);
     }
 
+    /// Another process changed `key`.
+    fn outdate(&self, key: &str) {
+        let state = self.state.lock().unwrap();
+        if let Some(load) = state.loads.get(key) {
+            load.is_outdated.store(true, Relaxed);
+        }
+        if let Some(held) = self.values.pin().get(key) {
+            held.is_stale.store(true, Relaxed);
+        }
+    }
+
     /// Invalidations sent while the subscription was down were missed, so
-    /// nothing held from before it came back can be trusted.
+    /// everything held from before it came back may have changed.
     fn subscribed(&self) {
         let mut state = self.state.lock().unwrap();
-        state.epoch += 1;
         state.listening = true;
-        self.values.pin().clear();
+        for load in state.loads.values() {
+            load.is_outdated.store(true, Relaxed);
+        }
+        for held in self.values.pin().values() {
+            held.is_stale.store(true, Relaxed);
+        }
     }
 
     fn unsubscribed(&self) {
@@ -249,11 +321,29 @@ impl Cache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, E>>,
     {
-        if let Some(value) = self.0.get(key) {
+        let held = self.0.get::<T>(key);
+        if let Some((value, false)) = held {
             return Ok(value);
         }
 
-        let (listening, epoch) = self.0.listening_and_epoch();
+        let mut loading = self.0.loading(key);
+        let turn = loading.load.turn.clone();
+        loading.turn = Some(match held {
+            // Stale: whoever is loading the new value has the turn, and
+            // everyone else is served the old one.
+            Some((stale, _)) => match turn.try_lock_owned() {
+                Ok(turn) => turn,
+                Err(_) => return Ok(stale),
+            },
+            None => {
+                let turn = turn.lock_owned().await;
+                if let Some((value, false)) = self.0.get(key) {
+                    return Ok(value);
+                }
+                turn
+            }
+        });
+        let listening = self.0.start(&loading.load);
         let mut redis = self.0.redis.clone();
         let value_key = format!("{}:val:{key}", self.0.namespace);
         let version_key = format!("{}:ver:{key}", self.0.namespace);
@@ -292,7 +382,7 @@ impl Cache {
         };
 
         let value = Arc::new(value);
-        self.0.insert(key, value.clone(), epoch);
+        self.0.insert(key, value.clone(), &loading.load);
         Ok(value)
     }
 
@@ -310,7 +400,7 @@ impl Cache {
     pub async fn invalidate(&self, key: &str) {
         // Not waiting for our own broadcast, so the caller reads its own write.
         self.0.remove(key);
-        let (listening, _) = self.0.listening_and_epoch();
+        let listening = self.0.state.lock().unwrap().listening;
         if !listening || self.0.broadcast(key).await.is_err() {
             self.0.state.lock().unwrap().unsent.insert(key.to_owned());
         }
@@ -337,7 +427,7 @@ async fn listen(cache: Weak<Inner>, client: redis::Client, channel: String) -> O
             match tokio::time::timeout(RETRY_DELAY, messages.next()).await {
                 Ok(Some(message)) => {
                     if let Ok(key) = message.get_payload::<String>() {
-                        cache.upgrade()?.remove(&key);
+                        cache.upgrade()?.outdate(&key);
                     }
                 }
                 Ok(None) => break,
