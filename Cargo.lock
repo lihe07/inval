@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "inval"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures-util",
  "inval-macros",
@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "inval-macros"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",

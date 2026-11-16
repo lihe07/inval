@@ -15,8 +15,11 @@ fn namespace() -> String {
     format!("test:{}:{}", std::process::id(), N.fetch_add(1, SeqCst))
 }
 
+/// A cache that has subscribed, so it reads Redis.
 async fn connect(namespace: &str) -> Cache {
-    Cache::connect(&url(), namespace).await.unwrap()
+    let cache = Cache::connect(&url(), namespace).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cache
 }
 
 /// A stand-in for Postgres: a value plus a count of how often it was read.
@@ -27,12 +30,12 @@ struct Db {
 }
 
 impl Db {
-    async fn load(&self) -> Result<u32, inval::Error> {
+    async fn load(&self) -> Result<u32, std::convert::Infallible> {
         self.reads.fetch_add(1, SeqCst);
         Ok(self.value.load(SeqCst))
     }
 
-    async fn store(&self, value: u32) -> Result<(), inval::Error> {
+    async fn store(&self, value: u32) -> Result<(), std::convert::Infallible> {
         self.value.store(value, SeqCst);
         Ok(())
     }
@@ -132,8 +135,8 @@ async fn max_entries_limits_memory() {
     let cache = Cache::builder(&url(), &ns)
         .max_entries(10)
         .connect()
-        .await
         .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let db = Db::default();
     let keys: Vec<String> = (0..1000).map(|i| format!("k{i}")).collect();
     for key in &keys {

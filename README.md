@@ -26,17 +26,11 @@ async fn save_settings(pg: &PgPool, tenant: u32, new: &Settings) -> Result<(), A
     Ok(())
 }
 
-#[derive(Debug, thiserror::Error)]
-enum AppError {
-    #[error(transparent)]
-    Db(#[from] sqlx::Error),
-    #[error(transparent)]
-    Cache(#[from] inval::Error),   // the only thing inval asks of your error type
-}
+type AppError = sqlx::Error;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    inval::set_global(Cache::connect("redis://127.0.0.1", "myapp").await?);
+    inval::set_global(Cache::connect("redis://127.0.0.1", "myapp")?);
     // ...
 }
 ```
@@ -45,10 +39,9 @@ The key is a `format!` string and can name the function's arguments. The
 function has to be `async` and return a `Result`, and its body only runs on a
 cache miss.
 
-Your error type stays yours. When Redis or serialization fails, inval hands
-you an `inval::Error` through `From`. `anyhow::Error` and `Box<dyn Error>`
-take it as they are. For your own enum, add a `#[from]` variant like the one
-above.
+Your error type stays yours, and the only errors you get back are the ones
+your function returned. `Cache::connect` fails only on a URL that isn't a
+Redis URL. Redis doesn't have to be up, then or later.
 
 Calling a marked function before `set_global` panics and tells you why. To
 use some other cache, pass it in, as in
@@ -57,15 +50,15 @@ use some other cache, pass it in, as in
 Without the macros:
 
 ```rust
-let cache = Cache::connect("redis://127.0.0.1", "myapp").await?;   // or inval::global()
+let cache = Cache::connect("redis://127.0.0.1", "myapp")?;   // or inval::global()
 
 let settings = cache.query("settings", || load_settings(&pg)).await?;   // Arc<Settings>
 cache.mutation("settings", || save_settings(&pg, new)).await?;
-cache.invalidate("settings").await?;
+cache.invalidate("settings").await;
 ```
 
 To cap memory, build the cache with
-`Cache::builder(url, ns).max_entries(10_000).connect().await?`.
+`Cache::builder(url, ns).max_entries(10_000).connect()?`.
 
 ## Python
 
@@ -118,21 +111,28 @@ A slow read can't bring an old value back. Each key has a version in Redis
 that every mutation bumps, and a loaded value is only stored if the version
 didn't move in the meantime.
 
-Redis pub/sub loses messages while a connection is down. That's the easiest
-way for a cache like this to go stale without anyone noticing, so inval stops
-using memory the moment its connection drops. Reads go to Redis until it has
-resubscribed.
+## When Redis is unreachable
+
+Nothing fails. A process that has lost Redis keeps serving what it holds in
+memory and calls the loader for the rest, so the database sees one read per
+key per process, not one per request.
+
+Redis pub/sub loses messages while a connection is down, so a disconnected
+process can serve a value another process has changed. That lasts as long as
+the outage: on resubscribing, a process empties its memory and reads
+everything again.
+
+An invalidation that can't reach Redis is kept and sent once Redis is back.
+Until then only the process that made the change sees it.
 
 ## Limits
 
 - A Rust cache belongs to the Tokio runtime that created it. Each
   `#[tokio::test]` gets its own runtime, so tests should create a cache per
   test with `Cache::connect` instead of setting the global one.
-- Redis errors come back to you. There's no fallback to the loader, because
-  a quiet fallback would send every request to Postgres the moment Redis
-  goes down.
-- If `fn` succeeds and Redis is unreachable, `mutation` returns an error and
-  other processes keep the old value. Call `invalidate` once Redis is back.
+- An unsent invalidation lives in memory. If the process exits before Redis
+  is back, the others keep the old value until the key is invalidated again.
+- A value that can't be stored as JSON is kept in memory only.
 - There's no TTL. Without `max_entries`, memory keeps every key it has read.
   With it, an arbitrary key is evicted when memory is full and fetched from
   Redis next time.

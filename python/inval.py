@@ -20,6 +20,9 @@ Without decorators:
     await cache.invalidate("settings")
 
 A query returns the same object to every caller, so treat it as read-only.
+
+Redis being unreachable is never an error. A disconnected process serves what
+it holds, loads the rest itself, and catches up when Redis returns.
 """
 
 import asyncio
@@ -33,7 +36,8 @@ from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
 from redis.exceptions import RedisError
 
-_RESUBSCRIBE_DELAY = 1.0
+# How often a lost subscription and unsent invalidations are retried.
+_RETRY_DELAY = 1.0
 
 # Stores a loaded value only if no mutation happened while it was loading.
 _SET_IF_VERSION = """
@@ -89,7 +93,8 @@ class Cache:
     @classmethod
     async def connect(cls, url, namespace, max_entries=None):
         """Processes with the same `namespace` share a cache. When
-        `max_entries` is reached, an arbitrary key is evicted."""
+        `max_entries` is reached, an arbitrary key is evicted. Redis is
+        connected to in the background and does not have to be up."""
         self = cls()
         self._namespace = namespace
         self._max_entries = None if max_entries is None else max(1, max_entries)
@@ -99,10 +104,13 @@ class Cache:
         self._pubsub_redis = Redis.from_url(url, retry=Retry(NoBackoff(), 0))
         self._set_if_version = self._redis.register_script(_SET_IF_VERSION)
         self._values = {}
+        # Whether invalidations are arriving. Redis is only used while they are.
         self._listening = False
         # Bumped on every invalidation; a load is only kept if it didn't change.
         self._epoch = 0
-        self._listener = asyncio.create_task(self._listen(await self._subscribe()))
+        # Invalidations Redis has not been told about yet.
+        self._unsent = set()
+        self._listener = asyncio.create_task(self._listen())
         return self
 
     async def close(self):
@@ -113,6 +121,7 @@ class Cache:
         await self._pubsub_redis.aclose()
 
     async def query(self, key, loader):
+        """The only errors are the loader's."""
         value = self._values.get(key, _MISSING)
         if value is not _MISSING:
             return value
@@ -120,17 +129,27 @@ class Cache:
         epoch = self._epoch
         value_key = f"{self._namespace}:val:{key}"
         version_key = f"{self._namespace}:ver:{key}"
-        stored, version = await self._redis.mget(value_key, version_key)
-        if stored is not None:
-            value = json.loads(stored)
+        # `None` when Redis can't be asked: the loader answers alone.
+        read = None
+        if self._listening:
+            with contextlib.suppress(RedisError, OSError):
+                read = await self._redis.mget(value_key, version_key)
+
+        if read is not None and read[0] is not None:
+            value = json.loads(read[0])
         else:
             value = await _call(loader)
-            await self._set_if_version(
-                keys=[value_key, version_key],
-                args=[version or 0, json.dumps(value)],
-            )
+            if read is not None:
+                with contextlib.suppress(RedisError, OSError, TypeError, ValueError):
+                    await self._set_if_version(
+                        keys=[value_key, version_key],
+                        args=[read[1] or 0, json.dumps(value)],
+                    )
 
-        self._insert(key, value, epoch)
+        if self._epoch == epoch:
+            if self._max_entries is not None and len(self._values) >= self._max_entries:
+                del self._values[next(iter(self._values))]
+            self._values[key] = value
         return value
 
     async def mutation(self, key, fn):
@@ -139,50 +158,57 @@ class Cache:
         return result
 
     async def invalidate(self, key):
-        async with self._redis.pipeline(transaction=True) as pipe:
-            pipe.incr(f"{self._namespace}:ver:{key}")
-            pipe.delete(f"{self._namespace}:val:{key}")
-            pipe.publish(f"{self._namespace}:invalidate", key)
-            await pipe.execute()
+        """If Redis can't be told now, it is told once it is reachable again."""
         # Not waiting for our own broadcast, so the caller reads its own write.
         self._remove(key)
+        if not (self._listening and await self._broadcast(key)):
+            self._unsent.add(key)
 
-    def _insert(self, key, value, epoch):
-        if self._listening and self._epoch == epoch:
-            if self._max_entries is not None and len(self._values) >= self._max_entries:
-                del self._values[next(iter(self._values))]
-            self._values[key] = value
+    async def _broadcast(self, key):
+        """Tells Redis and every other process that `key` changed."""
+        try:
+            async with self._redis.pipeline(transaction=True) as pipe:
+                pipe.incr(f"{self._namespace}:ver:{key}")
+                pipe.delete(f"{self._namespace}:val:{key}")
+                pipe.publish(f"{self._namespace}:invalidate", key)
+                await pipe.execute()
+        except (RedisError, OSError):
+            return False
+        return True
+
+    async def _send_unsent(self):
+        unsent, self._unsent = self._unsent, set()
+        for key in unsent:
+            if not await self._broadcast(key):
+                self._unsent.add(key)
 
     def _remove(self, key):
         self._epoch += 1
         self._values.pop(key, None)
 
-    def _reset(self, listening):
-        self._epoch += 1
-        self._listening = listening
-        self._values.clear()
-
-    async def _subscribe(self):
-        pubsub = self._pubsub_redis.pubsub()
-        await pubsub.subscribe(f"{self._namespace}:invalidate")
-        return pubsub
-
-    async def _listen(self, pubsub):
+    async def _listen(self):
         while True:
-            self._reset(True)
+            pubsub = self._pubsub_redis.pubsub()
             with contextlib.suppress(RedisError, OSError):
-                async for message in pubsub.listen():
-                    if message["type"] == "message":
+                await pubsub.subscribe(f"{self._namespace}:invalidate")
+                # Invalidations sent while the subscription was down were
+                # missed, so nothing held from before can be trusted.
+                self._epoch += 1
+                self._values.clear()
+                self._listening = True
+                await self._send_unsent()
+                while True:
+                    message = await pubsub.get_message(
+                        ignore_subscribe_messages=True, timeout=_RETRY_DELAY
+                    )
+                    if message is None:
+                        await self._send_unsent()
+                    else:
                         self._remove(message["data"].decode())
-            await pubsub.aclose()
-
-            # Invalidations may be missed until we resubscribe.
-            self._reset(False)
-            pubsub = None
-            while pubsub is None:
-                await asyncio.sleep(_RESUBSCRIBE_DELAY)
-                with contextlib.suppress(RedisError, OSError):
-                    pubsub = await self._subscribe()
+            self._listening = False
+            with contextlib.suppress(RedisError, OSError):
+                await pubsub.aclose()
+            await asyncio.sleep(_RETRY_DELAY)
 
 
 async def _call(fn):

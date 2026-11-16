@@ -7,7 +7,7 @@ use syn::{Error, Expr, Ident, ItemFn, LitStr, ReturnType, Token, parse_macro_inp
 
 /// `#[query("user:{id}")]` caches an `async fn` returning `Result<T, E>`; it
 /// then returns `Result<Arc<T>, E>`. The key may name the function's
-/// arguments. `E` must implement `From<inval::Error>`.
+/// arguments.
 ///
 /// Uses the global cache, or `#[query("user:{id}", cache = self.cache)]`.
 #[proc_macro_attribute]

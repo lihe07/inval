@@ -43,6 +43,7 @@ async def connect():
 
     async def connect():
         caches.append(await Cache.connect(URL, namespace))
+        await asyncio.sleep(0.1)  # subscribed, so it reads Redis
         return caches[-1]
 
     yield connect
@@ -114,18 +115,28 @@ async def test_survives_a_lost_subscription(connect, db):
         await redis.execute_command("CLIENT", "KILL", "TYPE", "pubsub")
     await asyncio.sleep(0.1)
 
-    # `a` cannot hear this, but has already stopped trusting its memory.
+    # `a` cannot hear this and keeps what it holds until it has resubscribed.
     await b.mutation("k", lambda: db.store(7))
-    assert await a.query("k", db.load) == 7
+    await eventually(a, db, 7)
 
     # Once resubscribed, `a` serves from memory and hears invalidations again.
-    await asyncio.sleep(1.5)
     reads = db.reads
     for _ in range(10):
         assert await a.query("k", db.load) == 7
     assert db.reads == reads
     await b.mutation("k", lambda: db.store(8))
     await eventually(a, db, 8)
+
+
+async def test_works_without_redis(db):
+    cache = await Cache.connect("redis://127.0.0.1:1", "none")
+    for _ in range(10):
+        assert await cache.query("k", db.load) == 0
+    assert db.reads == 1  # held in memory
+
+    await cache.mutation("k", lambda: db.store(7))
+    assert await cache.query("k", db.load) == 7
+    await cache.close()
 
 
 @pytest.fixture
@@ -195,6 +206,7 @@ async def test_own_cache_and_keys_from_arguments(connect):
 async def test_max_entries_limits_memory(db):
     namespace = f"pytest:{os.getpid()}:{next(_counter)}"
     cache = await Cache.connect(URL, namespace, max_entries=10)
+    await asyncio.sleep(0.1)
     keys = [f"k{i}" for i in range(1000)]
     for key in keys:
         await cache.query(key, db.load)
