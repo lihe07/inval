@@ -9,7 +9,7 @@ const READS: u32 = 2_000_000;
 async fn reads(cache: &Cache) {
     for _ in 0..READS {
         let value = cache
-            .query("k", || async { Ok::<_, inval::Error>(1u64) })
+            .query("k", || async { Ok::<_, std::convert::Infallible>(1u64) })
             .await
             .unwrap();
         std::hint::black_box(value);
@@ -19,7 +19,7 @@ async fn reads(cache: &Cache) {
 #[tokio::main]
 async fn main() {
     let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
-    let cache = Cache::connect(&url, "bench").await.unwrap();
+    let cache = Cache::connect(&url, "bench").unwrap();
     reads(&cache).await;
 
     for tasks in [1, 4, 16] {
@@ -43,7 +43,7 @@ async fn main() {
 
     let start = Instant::now();
     for _ in 0..2000 {
-        cache.invalidate("k").await.unwrap();
+        cache.invalidate("k").await;
         reads_once(&cache).await;
     }
     println!(
@@ -54,7 +54,7 @@ async fn main() {
 
 async fn reads_once(cache: &Cache) {
     cache
-        .query("k", || async { Ok::<_, inval::Error>(1u64) })
+        .query("k", || async { Ok::<_, std::convert::Infallible>(1u64) })
         .await
         .unwrap();
 }

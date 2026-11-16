@@ -21,15 +21,13 @@ fn namespace() -> String {
     )
 }
 
-/// An application's own error type. It only needs to accept inval's.
+/// An application's own error type. inval asks nothing of it.
 #[derive(Debug, thiserror::Error)]
 enum AppError {
     #[error("rejected")]
     Rejected,
     #[error(transparent)]
     Parse(#[from] std::num::ParseIntError),
-    #[error(transparent)]
-    Cache(#[from] inval::Error),
 }
 
 /// A stand-in for Postgres: a value plus a count of how often it was read.
@@ -52,7 +50,7 @@ async fn save_settings(value: u32) -> Result<u32, AppError> {
 
 #[tokio::test]
 async fn global_cache() {
-    inval::set_global(Cache::connect(&url(), &namespace()).await.unwrap());
+    inval::set_global(Cache::connect(&url(), &namespace()).unwrap());
 
     let first: Arc<u32> = settings().await.unwrap();
     assert_eq!((*first, *settings().await.unwrap()), (0, 0));
@@ -70,7 +68,7 @@ async fn global_cache() {
     assert_eq!(*settings().await.unwrap(), 7);
     assert_eq!(READS.load(SeqCst), 2, "a failed write invalidates nothing");
 
-    inval::global().invalidate("settings").await.unwrap();
+    inval::global().invalidate("settings").await;
     settings().await.unwrap();
     assert_eq!(READS.load(SeqCst), 3);
 }
@@ -97,7 +95,7 @@ impl Tenants {
 
 #[tokio::test]
 async fn own_cache_and_keys_from_arguments() {
-    let cache = Cache::connect(&url(), &namespace()).await.unwrap();
+    let cache = Cache::connect(&url(), &namespace()).unwrap();
     let tenants = Tenants {
         cache,
         loads: AtomicU32::new(0),

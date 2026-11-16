@@ -14,16 +14,10 @@
 //!     Ok(())
 //! }
 //!
-//! #[derive(Debug, thiserror::Error)]
-//! enum AppError {
-//!     #[error(transparent)]
-//!     Db(#[from] std::io::Error),
-//!     #[error(transparent)]
-//!     Cache(#[from] inval::Error),
-//! }
+//! type AppError = std::io::Error;
 //!
-//! # async fn demo() -> Result<(), AppError> {
-//! inval::set_global(Cache::connect("redis://127.0.0.1", "myapp").await?);
+//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+//! inval::set_global(Cache::connect("redis://127.0.0.1", "myapp")?);
 //!
 //! let current = settings(1).await?;
 //! save_settings(1, "dark").await?;
@@ -37,25 +31,30 @@
 //! # async fn load() -> Result<String, BoxError> { Ok(String::new()) }
 //! # async fn save() -> Result<(), BoxError> { Ok(()) }
 //! # async fn demo() -> Result<(), BoxError> {
-//! let cache = inval::Cache::connect("redis://127.0.0.1", "myapp").await?;
+//! let cache = inval::Cache::connect("redis://127.0.0.1", "myapp")?;
 //! let settings = cache.query("settings", || load()).await?;
 //! cache.mutation("settings", || save()).await?;
-//! cache.invalidate("settings").await?;
+//! cache.invalidate("settings").await;
 //! # Ok(()) }
 //! ```
+//!
+//! Redis being unreachable is never an error. A disconnected process serves
+//! what it holds, loads the rest itself, and catches up when Redis returns.
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use redis::aio::{ConnectionManager, PubSub};
+use redis::aio::{ConnectionManager, ConnectionManagerConfig, PubSub};
 use serde::{Serialize, de::DeserializeOwned};
 
 pub use inval_macros::{mutation, query};
 
-const RESUBSCRIBE_DELAY: Duration = Duration::from_secs(1);
+/// How often a lost subscription and unsent invalidations are retried.
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Stores a loaded value only if no mutation happened while it was loading.
 const SET_IF_VERSION: &str = r"
@@ -63,14 +62,10 @@ if (redis.call('GET', KEYS[2]) or '0') == ARGV[1] then
     redis.call('SET', KEYS[1], ARGV[2])
 end";
 
-/// Converted into your functions' error type with `From`.
+/// The URL given to [`Cache::connect`] is not a Redis URL.
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("redis: {0}")]
-    Redis(#[from] redis::RedisError),
-    #[error("could not serialize value: {0}")]
-    Serialize(#[from] serde_json::Error),
-}
+#[error("invalid Redis URL: {0}")]
+pub struct Error(#[from] redis::RedisError);
 
 type Value = Arc<dyn Any + Send + Sync>;
 
@@ -91,9 +86,12 @@ struct Inner {
 /// invalidation.
 #[derive(Default)]
 struct State {
+    /// Whether invalidations are arriving. Redis is only used while they are.
     listening: bool,
     /// Bumped on every invalidation; a load is only kept if it didn't change.
     epoch: u64,
+    /// Invalidations Redis has not been told about yet.
+    unsent: HashSet<String>,
 }
 
 impl Inner {
@@ -106,13 +104,14 @@ impl Inner {
         )
     }
 
-    fn epoch(&self) -> u64 {
-        self.state.lock().unwrap().epoch
+    fn listening_and_epoch(&self) -> (bool, u64) {
+        let state = self.state.lock().unwrap();
+        (state.listening, state.epoch)
     }
 
     fn insert(&self, key: &str, value: Value, epoch: u64) {
         let state = self.state.lock().unwrap();
-        if state.listening && state.epoch == epoch {
+        if state.epoch == epoch {
             let values = self.values.pin();
             // Hash order makes this a random eviction.
             if values.len() >= self.max_entries
@@ -130,11 +129,38 @@ impl Inner {
         self.values.pin().remove(key);
     }
 
-    fn reset(&self, listening: bool) {
+    /// Invalidations sent while the subscription was down were missed, so
+    /// nothing held from before it came back can be trusted.
+    fn subscribed(&self) {
         let mut state = self.state.lock().unwrap();
         state.epoch += 1;
-        state.listening = listening;
+        state.listening = true;
         self.values.pin().clear();
+    }
+
+    fn unsubscribed(&self) {
+        self.state.lock().unwrap().listening = false;
+    }
+
+    /// Tells Redis and every other process that `key` changed.
+    async fn broadcast(&self, key: &str) -> redis::RedisResult<()> {
+        let namespace = &self.namespace;
+        redis::pipe()
+            .atomic()
+            .incr(format!("{namespace}:ver:{key}"), 1)
+            .del(format!("{namespace}:val:{key}"))
+            .publish(format!("{namespace}:invalidate"), key)
+            .query_async(&mut self.redis.clone())
+            .await
+    }
+
+    async fn send_unsent(&self) {
+        let unsent = std::mem::take(&mut self.state.lock().unwrap().unsent);
+        for key in unsent {
+            if self.broadcast(&key).await.is_err() {
+                self.state.lock().unwrap().unsent.insert(key);
+            }
+        }
     }
 }
 
@@ -176,11 +202,15 @@ impl Builder {
         self
     }
 
-    pub async fn connect(self) -> Result<Cache, Error> {
+    /// Call inside the Tokio runtime that will use the cache. Redis is
+    /// connected to in the background and does not have to be up.
+    pub fn connect(self) -> Result<Cache, Error> {
         let client = redis::Client::open(self.url)?;
-        let redis = ConnectionManager::new(client.clone()).await?;
+        let redis = ConnectionManager::new_lazy_with_config(
+            client.clone(),
+            ConnectionManagerConfig::new(),
+        )?;
         let channel = format!("{}:invalidate", self.namespace);
-        let pubsub = subscribe(&client, &channel).await?;
         let inner = Arc::new(Inner {
             namespace: self.namespace,
             redis,
@@ -191,7 +221,7 @@ impl Builder {
             listener: OnceLock::new(),
         });
         // Weak, so the listener doesn't keep the cache alive.
-        let listener = tokio::spawn(listen(Arc::downgrade(&inner), client, channel, pubsub));
+        let listener = tokio::spawn(listen(Arc::downgrade(&inner), client, channel));
         let _ = inner.listener.set(listener);
         Ok(Cache(inner))
     }
@@ -207,15 +237,15 @@ impl Cache {
         }
     }
 
-    pub async fn connect(url: &str, namespace: &str) -> Result<Self, Error> {
-        Self::builder(url, namespace).connect().await
+    pub fn connect(url: &str, namespace: &str) -> Result<Self, Error> {
+        Self::builder(url, namespace).connect()
     }
 
-    /// Panics if `key` is read as two different types.
+    /// The only error is the loader's. Panics if `key` is read as two
+    /// different types.
     pub async fn query<T, E, F, Fut>(&self, key: &str, loader: F) -> Result<Arc<T>, E>
     where
         T: Serialize + DeserializeOwned + Send + Sync + 'static,
-        E: From<Error>,
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, E>>,
     {
@@ -223,63 +253,67 @@ impl Cache {
             return Ok(value);
         }
 
-        let epoch = self.0.epoch();
+        let (listening, epoch) = self.0.listening_and_epoch();
         let mut redis = self.0.redis.clone();
         let value_key = format!("{}:val:{key}", self.0.namespace);
         let version_key = format!("{}:ver:{key}", self.0.namespace);
-        let (stored, version): (Option<Vec<u8>>, Option<u64>) = redis::cmd("MGET")
-            .arg(&value_key)
-            .arg(&version_key)
-            .query_async(&mut redis)
-            .await
-            .map_err(Error::Redis)?;
+        // `None` when Redis can't be asked: the loader answers alone.
+        let read: Option<(Option<Vec<u8>>, Option<u64>)> = match listening {
+            true => redis::cmd("MGET")
+                .arg(&value_key)
+                .arg(&version_key)
+                .query_async(&mut redis)
+                .await
+                .ok(),
+            false => None,
+        };
 
         // A value that no longer deserializes (the type changed) counts as a miss.
-        let value = match stored.and_then(|bytes| serde_json::from_slice::<T>(&bytes).ok()) {
-            Some(value) => Arc::new(value),
+        let stored = read
+            .as_ref()
+            .and_then(|(bytes, _)| serde_json::from_slice::<T>(bytes.as_deref()?).ok());
+        let value = match stored {
+            Some(value) => value,
             None => {
                 let value = loader().await?;
-                let _: () = self
-                    .0
-                    .set_if_version
-                    .key(&value_key)
-                    .key(&version_key)
-                    .arg(version.unwrap_or(0))
-                    .arg(serde_json::to_vec(&value).map_err(Error::Serialize)?)
-                    .invoke_async(&mut redis)
-                    .await
-                    .map_err(Error::Redis)?;
-                Arc::new(value)
+                if let (Some((_, version)), Ok(json)) = (read, serde_json::to_vec(&value)) {
+                    let _: redis::RedisResult<()> = self
+                        .0
+                        .set_if_version
+                        .key(&value_key)
+                        .key(&version_key)
+                        .arg(version.unwrap_or(0))
+                        .arg(json)
+                        .invoke_async(&mut redis)
+                        .await;
+                }
+                value
             }
         };
 
+        let value = Arc::new(value);
         self.0.insert(key, value.clone(), epoch);
         Ok(value)
     }
 
     pub async fn mutation<R, E, F, Fut>(&self, key: &str, f: F) -> Result<R, E>
     where
-        E: From<Error>,
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<R, E>>,
     {
         let result = f().await?;
-        self.invalidate(key).await?;
+        self.invalidate(key).await;
         Ok(result)
     }
 
-    pub async fn invalidate(&self, key: &str) -> Result<(), Error> {
-        let namespace = &self.0.namespace;
-        let _: () = redis::pipe()
-            .atomic()
-            .incr(format!("{namespace}:ver:{key}"), 1)
-            .del(format!("{namespace}:val:{key}"))
-            .publish(format!("{namespace}:invalidate"), key)
-            .query_async(&mut self.0.redis.clone())
-            .await?;
+    /// If Redis can't be told now, it is told once it is reachable again.
+    pub async fn invalidate(&self, key: &str) {
         // Not waiting for our own broadcast, so the caller reads its own write.
         self.0.remove(key);
-        Ok(())
+        let (listening, _) = self.0.listening_and_epoch();
+        if !listening || self.0.broadcast(key).await.is_err() {
+            self.0.state.lock().unwrap().unsent.insert(key.to_owned());
+        }
     }
 }
 
@@ -290,30 +324,27 @@ async fn subscribe(client: &redis::Client, channel: &str) -> redis::RedisResult<
 }
 
 /// Returns once the cache is dropped.
-async fn listen(
-    cache: Weak<Inner>,
-    client: redis::Client,
-    channel: String,
-    mut pubsub: PubSub,
-) -> Option<()> {
+async fn listen(cache: Weak<Inner>, client: redis::Client, channel: String) -> Option<()> {
     loop {
-        cache.upgrade()?.reset(true);
+        let Ok(mut pubsub) = subscribe(&client, &channel).await else {
+            tokio::time::sleep(RETRY_DELAY).await;
+            continue;
+        };
+        cache.upgrade()?.subscribed();
+        cache.upgrade()?.send_unsent().await;
         let mut messages = pubsub.on_message();
-        while let Some(message) = messages.next().await {
-            if let Ok(key) = message.get_payload::<String>() {
-                cache.upgrade()?.remove(&key);
+        loop {
+            match tokio::time::timeout(RETRY_DELAY, messages.next()).await {
+                Ok(Some(message)) => {
+                    if let Ok(key) = message.get_payload::<String>() {
+                        cache.upgrade()?.remove(&key);
+                    }
+                }
+                Ok(None) => break,
+                Err(_idle) => cache.upgrade()?.send_unsent().await,
             }
         }
-        drop(messages);
-
-        // Invalidations may be missed until we resubscribe.
-        cache.upgrade()?.reset(false);
-        pubsub = loop {
-            tokio::time::sleep(RESUBSCRIBE_DELAY).await;
-            if let Ok(pubsub) = subscribe(&client, &channel).await {
-                break pubsub;
-            }
-        };
+        cache.upgrade()?.unsubscribed();
     }
 }
 

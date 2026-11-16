@@ -16,8 +16,11 @@ fn namespace() -> String {
     format!("test:{}:{}", std::process::id(), N.fetch_add(1, SeqCst))
 }
 
+/// A cache that has subscribed, so it reads Redis.
 async fn connect(namespace: &str) -> Cache {
-    Cache::connect(&url(), namespace).await.unwrap()
+    let cache = Cache::connect(&url(), namespace).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cache
 }
 
 /// A stand-in for Postgres: a value plus a count of how often it was read.
@@ -28,12 +31,12 @@ struct Db {
 }
 
 impl Db {
-    async fn load(&self) -> Result<u32, inval::Error> {
+    async fn load(&self) -> Result<u32, std::convert::Infallible> {
         self.reads.fetch_add(1, SeqCst);
         Ok(self.value.load(SeqCst))
     }
 
-    async fn store(&self, value: u32) -> Result<(), inval::Error> {
+    async fn store(&self, value: u32) -> Result<(), std::convert::Infallible> {
         self.value.store(value, SeqCst);
         Ok(())
     }
@@ -54,8 +57,8 @@ async fn eventually(cache: &Cache, db: &Db, expected: u32) {
     panic!("never saw {expected}");
 }
 
-/// Pub/sub drops messages while disconnected, so memory must not be trusted
-/// across a lost subscription.
+/// Pub/sub drops messages while disconnected, so nothing held from before a
+/// lost subscription survives its return.
 #[tokio::test]
 async fn survives_a_lost_subscription() {
     let (ns, db) = (namespace(), Db::default());
@@ -76,12 +79,11 @@ async fn survives_a_lost_subscription() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // `a` cannot hear this, but has already stopped trusting its memory.
+    // `a` cannot hear this and keeps what it holds until it has resubscribed.
     b.mutation("k", || db.store(7)).await.unwrap();
-    assert_eq!(read(&a, &db).await, 7);
+    eventually(&a, &db, 7).await;
 
     // Once resubscribed, `a` serves from memory and hears invalidations again.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
     let reads = db.reads.load(SeqCst);
     for _ in 0..10 {
         assert_eq!(read(&a, &db).await, 7);
