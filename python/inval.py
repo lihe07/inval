@@ -30,6 +30,7 @@ import contextlib
 import functools
 import inspect
 import json
+import time
 
 from redis.asyncio import Redis
 from redis.asyncio.retry import Retry
@@ -40,9 +41,14 @@ from redis.exceptions import RedisError
 _RETRY_DELAY = 1.0
 
 # Stores a loaded value only if no mutation happened while it was loading.
+# `ARGV[3]` is how long to keep it, in milliseconds, or 0 for good.
 _SET_IF_VERSION = """
 if (redis.call('GET', KEYS[2]) or '0') == ARGV[1] then
-    redis.call('SET', KEYS[1], ARGV[2])
+    if ARGV[3] == '0' then
+        redis.call('SET', KEYS[1], ARGV[2])
+    else
+        redis.call('SET', KEYS[1], ARGV[2], 'PX', ARGV[3])
+    end
 end"""
 
 _MISSING = object()
@@ -91,21 +97,25 @@ def _decorator(key, cache, method):
 
 class Cache:
     @classmethod
-    async def connect(cls, url, namespace, max_entries=None):
+    async def connect(cls, url, namespace, max_entries=None, max_age=None):
         """Processes with the same `namespace` share a cache. When
-        `max_entries` is reached, an arbitrary key is evicted. Redis is
-        connected to in the background and does not have to be up."""
+        `max_entries` is reached, an arbitrary key is evicted. A value is
+        loaded again once it is `max_age` seconds old, in memory or in Redis.
+        Redis is connected to in the background and does not have to be up."""
         self = cls()
         self._namespace = namespace
         self._max_entries = None if max_entries is None else max(1, max_entries)
+        self._max_age = max_age
         self._redis = Redis.from_url(url)
         # No retries: redis-py would silently resubscribe, hiding missed
         # invalidations.
         self._pubsub_redis = Redis.from_url(url, retry=Retry(NoBackoff(), 0))
         self._set_if_version = self._redis.register_script(_SET_IF_VERSION)
         self._values = {}
-        # Keys another process changed: still served, while one reader loads
-        # the new value.
+        # When each value was loaded, for `max_age`.
+        self._loaded_at = {}
+        # Keys another process changed: still served, like a value past
+        # `max_age`, while one reader loads the new value.
         self._stale = set()
         # Keys being loaded. Readers take turns, so one load runs at a time.
         self._loads = {}
@@ -126,7 +136,7 @@ class Cache:
     async def query(self, key, loader):
         """The only errors are the loader's."""
         value = self._values.get(key, _MISSING)
-        if value is not _MISSING and key not in self._stale:
+        if value is not _MISSING and not self._is_stale(key):
             return value
 
         load = self._loads.setdefault(key, _Load())
@@ -137,16 +147,15 @@ class Cache:
         load.readers += 1
         try:
             async with load.turn:
-                if value is _MISSING and key in self._values and key not in self._stale:
+                if value is _MISSING and key in self._values and not self._is_stale(key):
                     return self._values[key]
                 load.is_outdated = False
                 value = await self._load(key, loader)
                 if not load.is_outdated:
                     if self._max_entries is not None and len(self._values) >= self._max_entries:
-                        evict = next(iter(self._values))
-                        del self._values[evict]
-                        self._stale.discard(evict)
+                        self._forget(next(iter(self._values)))
                     self._values[key] = value
+                    self._loaded_at[key] = time.monotonic()
                     self._stale.discard(key)
                 return value
         finally:
@@ -170,7 +179,7 @@ class Cache:
             with contextlib.suppress(RedisError, OSError, TypeError, ValueError):
                 await self._set_if_version(
                     keys=[value_key, version_key],
-                    args=[read[1] or 0, json.dumps(value)],
+                    args=[read[1] or 0, json.dumps(value), int((self._max_age or 0) * 1000)],
                 )
         return value
 
@@ -207,8 +216,17 @@ class Cache:
     def _remove(self, key):
         """This process changed `key`: its next read must load."""
         self._outdate_load(key)
+        self._forget(key)
+
+    def _forget(self, key):
         self._values.pop(key, None)
+        self._loaded_at.pop(key, None)
         self._stale.discard(key)
+
+    def _is_stale(self, key):
+        if key in self._stale:
+            return True
+        return self._max_age is not None and time.monotonic() - self._loaded_at[key] >= self._max_age
 
     def _outdate(self, key):
         """Another process changed `key`."""

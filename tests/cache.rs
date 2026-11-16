@@ -206,3 +206,21 @@ async fn others_are_served_the_old_value_during_a_reload() {
     assert_eq!(read(&a, &db).await, 7);
     assert_eq!(db.reads.load(SeqCst), 2);
 }
+
+/// The backstop for a change nobody invalidated.
+#[tokio::test]
+async fn max_age_reloads_an_old_value() {
+    let ns = namespace();
+    let cache = Cache::builder(&url(), &ns)
+        .max_age(Duration::from_millis(100))
+        .connect()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let db = Db::default();
+    assert_eq!(read(&cache, &db).await, 0);
+
+    db.store(7).await.unwrap();
+    assert_eq!(read(&cache, &db).await, 0);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(read(&cache, &db).await, 7);
+}

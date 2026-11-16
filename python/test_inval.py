@@ -158,6 +158,18 @@ async def test_others_are_served_the_old_value_during_a_reload(connect, db):
     assert db.reads == 2
 
 
+async def test_max_age_reloads_an_old_value(db):
+    cache = await Cache.connect(URL, f"pytest:{os.getpid()}:{next(_counter)}", max_age=0.1)
+    await asyncio.sleep(0.1)
+    assert await cache.query("k", db.load) == 0
+
+    db.store(7)  # nobody invalidates
+    assert await cache.query("k", db.load) == 0
+    await asyncio.sleep(0.15)
+    assert await cache.query("k", db.load) == 7
+    await cache.close()
+
+
 async def test_works_without_redis(db):
     cache = await Cache.connect("redis://127.0.0.1:1", "none")
     for _ in range(10):

@@ -46,7 +46,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig, PubSub};
@@ -58,9 +58,14 @@ pub use inval_macros::{mutation, query};
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Stores a loaded value only if no mutation happened while it was loading.
+/// `ARGV[3]` is how long to keep it, in milliseconds, or 0 for good.
 const SET_IF_VERSION: &str = r"
 if (redis.call('GET', KEYS[2]) or '0') == ARGV[1] then
-    redis.call('SET', KEYS[1], ARGV[2])
+    if ARGV[3] == '0' then
+        redis.call('SET', KEYS[1], ARGV[2])
+    else
+        redis.call('SET', KEYS[1], ARGV[2], 'PX', ARGV[3])
+    end
 end";
 
 /// The URL given to [`Cache::connect`] is not a Redis URL.
@@ -79,15 +84,17 @@ struct Inner {
     set_if_version: redis::Script,
     values: papaya::HashMap<String, Arc<Held>>,
     max_entries: usize,
+    max_age: Option<Duration>,
     state: Mutex<State>,
     listener: OnceLock<tokio::task::JoinHandle<Option<()>>>,
 }
 
-/// A value in memory. Once another process changed it, it is stale: still
-/// served, while one reader loads the new one.
+/// A value in memory. Once another process changed it, or it is older than
+/// `max_age`, it is stale: still served, while one reader loads the new one.
 struct Held {
     value: Value,
     is_stale: AtomicBool,
+    loaded_at: Instant,
 }
 
 /// A key being loaded. Readers take turns, so one load runs at a time.
@@ -137,7 +144,10 @@ impl Inner {
             .clone()
             .downcast()
             .unwrap_or_else(|_| panic!("cache key {key:?} read as two different types"));
-        Some((value, held.is_stale.load(Relaxed)))
+        let is_too_old = self
+            .max_age
+            .is_some_and(|max_age| held.loaded_at.elapsed() >= max_age);
+        Some((value, is_too_old || held.is_stale.load(Relaxed)))
     }
 
     fn loading<'a>(&'a self, key: &'a str) -> Loading<'a> {
@@ -173,6 +183,7 @@ impl Inner {
         let held = Held {
             value,
             is_stale: AtomicBool::new(false),
+            loaded_at: Instant::now(),
         };
         values.insert(key.to_owned(), Arc::new(held));
     }
@@ -265,6 +276,7 @@ pub struct Builder {
     url: String,
     namespace: String,
     max_entries: usize,
+    max_age: Option<Duration>,
 }
 
 impl Builder {
@@ -276,6 +288,14 @@ impl Builder {
 
     /// Call inside the Tokio runtime that will use the cache. Redis is
     /// connected to in the background and does not have to be up.
+    /// Unlimited by default. A value is loaded again once it is this old, in
+    /// memory or in Redis, so one that reached a process through Redis can be
+    /// served for up to twice as long.
+    pub fn max_age(mut self, max_age: Duration) -> Self {
+        self.max_age = Some(max_age);
+        self
+    }
+
     pub fn connect(self) -> Result<Cache, Error> {
         let client = redis::Client::open(self.url)?;
         let redis = ConnectionManager::new_lazy_with_config(
@@ -289,6 +309,7 @@ impl Builder {
             set_if_version: redis::Script::new(SET_IF_VERSION),
             values: papaya::HashMap::new(),
             max_entries: self.max_entries,
+            max_age: self.max_age,
             state: Mutex::default(),
             listener: OnceLock::new(),
         });
@@ -306,6 +327,7 @@ impl Cache {
             url: url.to_owned(),
             namespace: namespace.to_owned(),
             max_entries: usize::MAX,
+            max_age: None,
         }
     }
 
@@ -374,6 +396,11 @@ impl Cache {
                         .key(&version_key)
                         .arg(version.unwrap_or(0))
                         .arg(json)
+                        .arg(
+                            self.0
+                                .max_age
+                                .map_or(0, |max_age| max_age.as_millis() as u64),
+                        )
                         .invoke_async(&mut redis)
                         .await;
                 }
