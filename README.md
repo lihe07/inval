@@ -57,8 +57,10 @@ cache.mutation("settings", || save_settings(&pg, new)).await?;
 cache.invalidate("settings").await;
 ```
 
-To cap memory, build the cache with
-`Cache::builder(url, ns).max_entries(10_000).connect()?`.
+`Cache::builder(url, ns)` takes two options before `.connect()?`.
+`.max_entries(10_000)` caps memory. `.max_age(Duration::from_secs(300))`
+loads a value again once it is that old, for data that changes with time or
+that something may change without invalidating it.
 
 ## Python
 
@@ -86,7 +88,8 @@ async def lifespan(app):
 
 The decorated function can be sync or async, but you always `await` the
 result. To use some other cache, pass `cache=cache`. To cap memory, pass
-`max_entries=10_000` to `Cache.connect`. Without decorators, call
+`max_entries=10_000` to `Cache.connect`, and `max_age=300` (seconds) to load
+values again at that age. Without decorators, call
 `await cache.query(key, loader)`, `await cache.mutation(key, fn)` and
 `await cache.invalidate(key)`.
 
@@ -133,9 +136,11 @@ Until then only the process that made the change sees it.
 - An unsent invalidation lives in memory. If the process exits before Redis
   is back, the others keep the old value until the key is invalidated again.
 - A value that can't be stored as JSON is kept in memory only.
-- There's no TTL. Without `max_entries`, memory keeps every key it has read.
-  With it, an arbitrary key is evicted when memory is full and fetched from
-  Redis next time.
+- Without `max_age`, a value lives until it is invalidated. With it, a value
+  that reached a process through Redis can be up to twice that old.
+- Without `max_entries`, memory keeps every key it has read. With it, an
+  arbitrary key is evicted when memory is full and fetched from Redis next
+  time.
 - Give Redis room for every key. If Redis evicts a version key, the guard
   against slow reads writing back old values gets weaker.
 - Redis Cluster isn't supported, since a key's value and version could land
